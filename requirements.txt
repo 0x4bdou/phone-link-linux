@@ -1,3 +1,4 @@
 Flask
 PySide6
 qrcode[pil]
+pyotp

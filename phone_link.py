@@ -1,26 +1,32 @@
 
 import io
+import os
 import secrets
 import shutil
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 
+import pyotp
 import qrcode
+
 from flask import (
     Flask,
     Response,
     abort,
+    redirect,
     render_template_string,
     request,
-    send_from_directory,
+    session,
+    url_for,
 )
 from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, QTimer, QRectF
+from PySide6.QtGui import QPainter, QPen, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -33,7 +39,7 @@ from PySide6.QtWidgets import (
 
 
 # ============================================================
-# Configuration
+# CONFIGURATION
 # ============================================================
 
 APP_NAME = "Phone Link"
@@ -47,29 +53,85 @@ SHARED_DIR = BASE_DIR / "Shared"
 CONFIG_DIR = Path.home() / ".config" / "phone-link"
 CERT_FILE = CONFIG_DIR / "cert.pem"
 KEY_FILE = CONFIG_DIR / "key.pem"
+TOTP_SECRET_FILE = CONFIG_DIR / "totp.secret"
+SESSION_SECRET_FILE = CONFIG_DIR / "session.secret"
 
-for directory in (BASE_DIR, RECEIVED_DIR, SHARED_DIR, CONFIG_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
-
-# Restrict local file access on Linux.
-for directory in (BASE_DIR, RECEIVED_DIR, SHARED_DIR, CONFIG_DIR):
-    directory.chmod(0o700)
-
-# Generate a new temporary password every time the app starts.
-PASSWORD = secrets.token_urlsafe(32)
 USERNAME = "phone"
 
-web_app = Flask(__name__)
-web_app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
-web_app.config["MAX_FORM_MEMORY_SIZE"] = 1024 * 1024
+for directory in (
+    BASE_DIR,
+    RECEIVED_DIR,
+    SHARED_DIR,
+    CONFIG_DIR,
+):
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
 
 
 # ============================================================
-# Network and file helpers
+# PERSISTENT SECRETS
+# ============================================================
+
+def load_or_create_secret(path, generator):
+    """Load a persistent secret or create it with private permissions."""
+    if path.exists():
+        secret = path.read_text().strip()
+
+        if not secret:
+            raise RuntimeError(f"Secret file is empty: {path}")
+
+        return secret
+
+    secret = generator()
+
+    # Exclusive creation avoids accidentally overwriting an existing secret.
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+
+    with os.fdopen(descriptor, "w") as file:
+        file.write(secret + "\n")
+
+    return secret
+
+
+TOTP_SECRET = load_or_create_secret(
+    TOTP_SECRET_FILE,
+    pyotp.random_base32,
+)
+
+SESSION_SECRET = load_or_create_secret(
+    SESSION_SECRET_FILE,
+    lambda: secrets.token_hex(32),
+)
+
+totp = pyotp.TOTP(
+    TOTP_SECRET,
+    interval=60,
+    digits=6,
+)
+
+web_app = Flask(__name__)
+web_app.secret_key = SESSION_SECRET
+
+web_app.config.update(
+    MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    PERMANENT_SESSION_LIFETIME=3600,
+    MAX_FORM_MEMORY_SIZE=1024 * 1024,
+)
+
+
+# ============================================================
+# NETWORK AND TLS
 # ============================================================
 
 def get_local_ip():
-    """Determine the preferred local IPv4 address."""
+    """Find the preferred local IPv4 address."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     try:
@@ -81,16 +143,36 @@ def get_local_ip():
         sock.close()
 
 
-def unique_path(directory: Path, original_name: str) -> Path:
-    """Create a safe filename without overwriting existing files."""
+def verify_tls_files():
+    if not CERT_FILE.is_file() or not KEY_FILE.is_file():
+        raise RuntimeError(
+            "TLS certificate or key is missing.\n"
+            f"Certificate: {CERT_FILE}\n"
+            f"Private key: {KEY_FILE}\n"
+            "Generate both files before starting Phone Link."
+        )
+
+    if KEY_FILE.stat().st_mode & 0o077:
+        raise RuntimeError(
+            f"Private key permissions must be 600.\n"
+            f"Run: chmod 600 '{KEY_FILE}'"
+        )
+
+
+# ============================================================
+# FILE HELPERS
+# ============================================================
+
+def unique_path(directory, original_name):
+    """Generate a safe filename without overwriting existing files."""
     safe_name = secure_filename(original_name) or "uploaded_file"
-    destination = directory / safe_name
+    candidate = directory / safe_name
 
-    if not destination.exists():
-        return destination
+    if not candidate.exists():
+        return candidate
 
-    stem = destination.stem
-    suffix = destination.suffix
+    stem = candidate.stem
+    suffix = candidate.suffix
     counter = 1
 
     while True:
@@ -103,7 +185,7 @@ def unique_path(directory: Path, original_name: str) -> Path:
 
 
 def list_shared_files():
-    """Return regular files in the explicitly shared directory."""
+    """List regular files that the user explicitly chose to share."""
     return sorted(
         item.name
         for item in SHARED_DIR.iterdir()
@@ -111,164 +193,169 @@ def list_shared_files():
     )
 
 
-def verify_tls_files():
-    """Check that the TLS certificate and private key exist."""
-    if not CERT_FILE.is_file() or not KEY_FILE.is_file():
-        raise RuntimeError(
-            "TLS files are missing.\n"
-            f"Expected certificate: {CERT_FILE}\n"
-            f"Expected private key: {KEY_FILE}\n"
-            "Generate them using the OpenSSL instructions."
-        )
-
-    # Never accept a broadly readable private key.
-    if KEY_FILE.stat().st_mode & 0o077:
-        raise RuntimeError(
-            f"Private key permissions are too broad: {KEY_FILE}\n"
-            f"Run: chmod 600 '{KEY_FILE}'"
-        )
-
-
 # ============================================================
-# Android web interface
+# ANDROID WEB INTERFACE
 # ============================================================
 
-HTML_PAGE = """
+LOGIN_PAGE = """
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-
-    <title>Phone Link</title>
-
-    <style>
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            margin: 0;
-            padding: 24px;
-            background: #10131a;
-            color: #edf0f7;
-            font-family: system-ui, sans-serif;
-        }
-
-        main {
-            max-width: 650px;
-            margin: auto;
-        }
-
-        h1 {
-            font-size: 29px;
-            margin-bottom: 8px;
-        }
-
-        h2 {
-            font-size: 19px;
-        }
-
-        .muted {
-            color: #aab3c4;
-            font-size: 14px;
-        }
-
-        .card {
-            margin: 18px 0;
-            padding: 18px;
-            border: 1px solid #303747;
-            border-radius: 14px;
-            background: #1b202b;
-        }
-
-        input[type=file],
-        button {
-            width: 100%;
-            padding: 13px;
-            margin-top: 12px;
-            border-radius: 9px;
-            font-size: 16px;
-        }
-
-        input[type=file] {
-            background: #272e3b;
-            color: white;
-        }
-
-        button {
-            border: 0;
-            background: #8bb7ff;
-            color: #10131a;
-            font-weight: 600;
-            cursor: pointer;
-        }
-
-        a {
-            color: #a9caff;
-            overflow-wrap: anywhere;
-        }
-
-        li {
-            margin: 14px 0;
-            overflow-wrap: anywhere;
-        }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone Link Login</title>
+<style>
+* { box-sizing: border-box; }
+body {
+    background: #10131a;
+    color: #edf0f7;
+    font: 16px system-ui, sans-serif;
+    padding: 24px;
+}
+main {
+    max-width: 400px;
+    margin: 60px auto;
+    background: #1b202b;
+    padding: 24px;
+    border: 1px solid #303747;
+    border-radius: 14px;
+}
+input, button {
+    width: 100%;
+    padding: 14px;
+    margin-top: 12px;
+    border-radius: 9px;
+    font-size: 18px;
+}
+input {
+    background: #10131a;
+    color: white;
+    border: 1px solid #394357;
+    text-align: center;
+    letter-spacing: 5px;
+}
+button {
+    background: #8bb7ff;
+    border: 0;
+    color: #10131a;
+    font-weight: bold;
+}
+.error { color: #ff9292; }
+.muted { color: #aab3c4; font-size: 14px; }
+</style>
 </head>
-
 <body>
 <main>
-    <h1>Phone Link</h1>
-    <p class="muted">
-        Private file transfers between your phone and computer.
-    </p>
+<h2>Phone Link</h2>
+<p>Enter the current six-digit code shown on your computer.</p>
+{% if error %}
+<p class="error">{{ error }}</p>
+{% endif %}
+<form method="post" action="/login" autocomplete="off">
+<input
+    name="code"
+    type="text"
+    inputmode="numeric"
+    pattern="[0-9]{6}"
+    maxlength="6"
+    placeholder="000000"
+    autocomplete="one-time-code"
+    required
+    autofocus>
+<button type="submit">Verify code</button>
+</form>
+<p class="muted">Codes expire every 60 seconds.</p>
+</main>
+</body>
+</html>
+"""
 
-    <section class="card">
-        <h2>Send files to Kali Linux</h2>
+TRANSFER_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone Link</title>
+<style>
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    padding: 24px;
+    background: #10131a;
+    color: #edf0f7;
+    font: 16px system-ui, sans-serif;
+}
+main { max-width: 650px; margin: auto; }
+h1 { font-size: 29px; margin-bottom: 8px; }
+h2 { font-size: 19px; }
+.muted { color: #aab3c4; font-size: 14px; }
+.card {
+    margin: 18px 0;
+    padding: 18px;
+    background: #1b202b;
+    border: 1px solid #303747;
+    border-radius: 14px;
+}
+input[type=file], button {
+    width: 100%;
+    padding: 13px;
+    margin-top: 12px;
+    border-radius: 9px;
+    font-size: 16px;
+}
+input[type=file] {
+    background: #272e3b;
+    color: white;
+}
+button {
+    background: #8bb7ff;
+    color: #10131a;
+    border: 0;
+    font-weight: 600;
+}
+a { color: #a9caff; overflow-wrap: anywhere; }
+li { margin: 14px 0; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<main>
+<h1>Phone Link</h1>
+<p class="muted">Local file transfers between your phone and computer.</p>
 
-        <p>Select one or more files on your phone.</p>
+<section class="card">
+<h2>Send files to Kali Linux</h2>
+<form action="/upload" method="post" enctype="multipart/form-data">
+<input type="file" name="files" multiple required>
+<button type="submit">Upload files</button>
+</form>
+</section>
 
-        <form action="/upload"
-              method="post"
-              enctype="multipart/form-data">
+<section class="card">
+<h2>Download files from Kali Linux</h2>
+{% if files %}
+<ul>
+{% for filename in files %}
+<li>
+    {{ filename }}<br>
+    <a href="{{ url_for('download_file', filename=filename) }}">
+        Download file
+    </a>
+</li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="muted">No shared files yet. Add them from the desktop app.</p>
+{% endif %}
+</section>
 
-            <input type="file"
-                   name="files"
-                   multiple
-                   required>
+<form method="post" action="/logout">
+<button type="submit">Log out</button>
+</form>
 
-            <button type="submit">Upload files</button>
-        </form>
-    </section>
-
-    <section class="card">
-        <h2>Download files from Kali Linux</h2>
-
-        {% if files %}
-            <ul>
-            {% for filename in files %}
-                <li>
-                    {{ filename }}
-                    <br>
-                    <a href="{{ url_for('download_file',
-                                        filename=filename) }}">
-                        Download file
-                    </a>
-                </li>
-            {% endfor %}
-            </ul>
-        {% else %}
-            <p class="muted">
-                No shared files yet.
-                Add files using the desktop application.
-            </p>
-        {% endif %}
-    </section>
-
-    <p class="muted">
-        Keep this connection on a trusted network.
-        Do not share your login credentials.
-    </p>
+<p class="muted">
+Use only on a trusted network. Keep your pairing secret private.
+</p>
 </main>
 </body>
 </html>
@@ -276,31 +363,19 @@ HTML_PAGE = """
 
 
 # ============================================================
-# Authentication and HTTP security headers
+# WEB SECURITY
 # ============================================================
 
 @web_app.before_request
 def require_authentication():
-    """Require HTTP Basic authentication for every endpoint."""
-    credentials = request.authorization
+    """Require a valid session for all routes except login."""
+    if request.endpoint == "login":
+        return None
 
-    if (
-        credentials is None
-        or credentials.type.lower() != "basic"
-        or credentials.username != USERNAME
-        or not secrets.compare_digest(
-            credentials.password or "",
-            PASSWORD,
-        )
-    ):
-        return Response(
-            "Authentication required",
-            status=401,
-            headers={
-                "WWW-Authenticate": 'Basic realm="Phone Link"',
-                "Cache-Control": "no-store",
-            },
-        )
+    if not session.get("authenticated"):
+        return redirect(url_for("login"))
+
+    return None
 
 
 @web_app.after_request
@@ -321,20 +396,52 @@ def add_security_headers(response):
 
 
 # ============================================================
-# Transfer routes
+# LOGIN AND LOGOUT
+# ============================================================
+
+@web_app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+
+    if request.method == "POST":
+        code = request.form.get("code", "").strip()
+
+        if (
+            len(code) == 6
+            and code.isascii()
+            and code.isdigit()
+            and totp.verify(code, valid_window=0)
+        ):
+            session.clear()
+            session["authenticated"] = True
+            session.permanent = True
+            return redirect(url_for("index"))
+
+        error = "Invalid or expired code. Enter the current code."
+
+    return render_template_string(LOGIN_PAGE, error=error)
+
+
+@web_app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ============================================================
+# FILE TRANSFERS
 # ============================================================
 
 @web_app.route("/", methods=["GET"])
 def index():
     return render_template_string(
-        HTML_PAGE,
+        TRANSFER_PAGE,
         files=list_shared_files(),
     )
 
 
 @web_app.route("/upload", methods=["POST"])
 def upload():
-    """Receive files from the authenticated Android browser."""
     uploaded_files = request.files.getlist("files")
     saved_count = 0
 
@@ -372,7 +479,6 @@ def upload():
 
 @web_app.route("/download/<path:filename>", methods=["GET"])
 def download_file(filename):
-    """Download a file only from the explicitly shared directory."""
     return send_from_directory(
         SHARED_DIR,
         filename,
@@ -392,23 +498,62 @@ def not_found(_error):
 
 
 # ============================================================
-# Desktop application
+# CIRCULAR COUNTDOWN WIDGET
+# ============================================================
+
+class CountdownCircle(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.remaining = 60
+        self.setFixedSize(94, 94)
+
+    def set_remaining(self, seconds):
+        if seconds != self.remaining:
+            self.remaining = seconds
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = QRectF(8, 8, 78, 78)
+
+        # Background ring
+        painter.setPen(QPen(QColor("#303747"), 6))
+        painter.drawArc(rect, 90 * 16, -360 * 16)
+
+        # Remaining time
+        painter.setPen(QPen(QColor("#8bb7ff"), 6))
+        angle = int(360 * self.remaining / 60)
+        painter.drawArc(rect, 90 * 16, -angle * 16)
+
+        painter.setPen(QColor("#edf0f7"))
+        painter.setFont(QFont("Sans Serif", 15, QFont.Weight.Bold))
+        painter.drawText(
+            self.rect(),
+            Qt.AlignmentFlag.AlignCenter,
+            str(self.remaining),
+        )
+
+        painter.end()
+
+
+# ============================================================
+# DESKTOP APPLICATION
 # ============================================================
 
 class PhoneLinkWindow(QMainWindow):
-
     def __init__(self):
         super().__init__()
 
         verify_tls_files()
 
         self.setWindowTitle(APP_NAME)
-        self.resize(560, 700)
+        self.resize(560, 760)
 
         self.local_ip = get_local_ip()
         self.url = f"https://{self.local_ip}:{PORT}/"
 
-        # Bind to all interfaces so another device on the LAN can connect.
         self.server = make_server(
             "0.0.0.0",
             PORT,
@@ -426,25 +571,25 @@ class PhoneLinkWindow(QMainWindow):
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         title = QLabel(APP_NAME)
-        title.setStyleSheet(
-            "font-size: 28px; font-weight: bold;"
-        )
+        title.setStyleSheet("font-size:28px;font-weight:bold;")
         layout.addWidget(title)
 
         subtitle = QLabel(
             "Transfer files between Android and Kali Linux"
         )
-        subtitle.setStyleSheet("color: #9ca8bb;")
+        subtitle.setStyleSheet("color:#9ca8bb;")
         layout.addWidget(subtitle)
 
         layout.addWidget(
             QLabel("1. Connect both devices to the same trusted Wi-Fi.")
         )
 
-        layout.addWidget(QLabel("2. Open this HTTPS address on your phone:"))
+        layout.addWidget(
+            QLabel("2. Open this HTTPS address on your phone:")
+        )
 
         address = QLabel(self.url)
         address.setWordWrap(True)
@@ -462,18 +607,33 @@ class PhoneLinkWindow(QMainWindow):
         )
         layout.addWidget(copy_button)
 
-        password_label = QLabel(
-            f"Username: {USERNAME}\n"
-            f"Temporary password: {PASSWORD}"
+        layout.addWidget(
+            QLabel("3. Enter this current six-digit login code:")
         )
-        password_label.setWordWrap(True)
-        password_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
+
+        self.code_label = QLabel()
+        self.code_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.code_label.setStyleSheet("""
+            font-size:30px;
+            font-weight:bold;
+            letter-spacing:5px;
+            background:#202735;
+            padding:12px;
+            border-radius:8px;
+        """)
+        layout.addWidget(self.code_label)
+
+        self.countdown = CountdownCircle()
+        layout.addWidget(
+            self.countdown,
+            alignment=Qt.AlignmentFlag.AlignCenter,
         )
-        password_label.setStyleSheet(
-            "background:#202735;padding:12px;border-radius:8px;"
-        )
-        layout.addWidget(password_label)
+
+        self.refresh_totp_display()
+
+        self.totp_timer = QTimer(self)
+        self.totp_timer.timeout.connect(self.refresh_totp_display)
+        self.totp_timer.start(250)
 
         qr_label = QLabel()
         qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -487,8 +647,8 @@ class PhoneLinkWindow(QMainWindow):
 
         qr_label.setPixmap(
             pixmap.scaled(
-                220,
-                220,
+                190,
+                190,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -496,7 +656,7 @@ class PhoneLinkWindow(QMainWindow):
         layout.addWidget(qr_label)
 
         layout.addWidget(
-            QLabel("3. Scan the QR code, open the link, and authenticate.")
+            QLabel("4. Scan the QR code to open Phone Link on Android.")
         )
 
         share_button = QPushButton("Choose files to send to phone")
@@ -519,26 +679,28 @@ class PhoneLinkWindow(QMainWindow):
 
         self.setStyleSheet("""
             QMainWindow, QWidget {
-                background: #11151d;
-                color: #edf0f7;
-                font-size: 14px;
+                background:#11151d;
+                color:#edf0f7;
+                font-size:14px;
             }
-
             QPushButton {
-                background: #273348;
-                border: 1px solid #3c4a61;
-                border-radius: 9px;
-                padding: 12px;
-                text-align: left;
+                background:#273348;
+                border:1px solid #3c4a61;
+                border-radius:9px;
+                padding:12px;
+                text-align:left;
             }
-
             QPushButton:hover {
-                background: #354761;
+                background:#354761;
             }
         """)
 
+    def refresh_totp_display(self):
+        remaining = 60 - (int(time.time()) % 60)
+        self.code_label.setText(totp.now())
+        self.countdown.set_remaining(remaining)
+
     def add_files(self):
-        """Copy selected files into the explicitly shared directory."""
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Choose files to share",
@@ -564,12 +726,10 @@ class PhoneLinkWindow(QMainWindow):
                 shutil.copy2(source_path, destination)
                 count += 1
             except OSError as error:
-                self.status.setText(
-                    f"Could not share a file: {error}"
-                )
+                self.status.setText(f"Could not share file: {error}")
 
         self.status.setText(
-            f"Shared {count} file(s). Refresh the phone webpage."
+            f"Added {count} file(s). Refresh the phone webpage."
         )
 
     def open_received_folder(self):
@@ -579,24 +739,30 @@ class PhoneLinkWindow(QMainWindow):
         subprocess.Popen(["xdg-open", str(SHARED_DIR)])
 
     def closeEvent(self, event):
-        """Stop the HTTP server cleanly when the window closes."""
-        self.status.setText("Stopping server...")
-
+        self.totp_timer.stop()
         self.server.shutdown()
         self.server.server_close()
-
         self.server_thread.join(timeout=3)
-
         event.accept()
 
 
 # ============================================================
-# Entry point
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
-    qt_app = QApplication([])
-    window = PhoneLinkWindow()
-    window.show()
-    qt_app.exec()
+    try:
+        verify_tls_files()
 
+        application = QApplication([])
+        window = PhoneLinkWindow()
+        window.show()
+
+        application.exec()
+
+    except OSError as error:
+        print(f"Could not start Phone Link: {error}")
+        raise
+    except RuntimeError as error:
+        print(f"Configuration error: {error}")
+        raise
